@@ -72,19 +72,51 @@ done
 
 as_odoo() { runuser -u odoo -- env -i PATH="$PATH" HOME="$DATA_DIR" LANG=C.UTF-8 "$@"; }
 
+# missing: no database yet. empty: the database exists but base never finished
+# installing (an interrupted first start). ready: anything else. A connection
+# error makes the script exit instead of guessing.
 db_state() {
-  if [ -z "$(psql "$DATABASE_URL" -qtAc "SELECT 1 FROM pg_database WHERE datname = '${DB_NAME}'")" ]; then
-    echo missing
-  elif [ -z "$(PGPASSWORD="$ODOO_DB_PASSWORD" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -qtAc "SELECT 1 FROM pg_tables WHERE tablename = 'ir_module_module'")" ]; then
-    echo empty
-  else
-    echo ready
-  fi
+  python3 - "$DB_NAME" <<'PY'
+import os, sys, psycopg2
+url, name = os.environ["DATABASE_URL"], sys.argv[1]
+with psycopg2.connect(url) as c, c.cursor() as cur:
+    cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (name,))
+    if not cur.fetchone():
+        print("missing"); sys.exit()
+with psycopg2.connect(url, dbname=name) as c, c.cursor() as cur:
+    cur.execute("SELECT to_regclass('public.ir_module_module') IS NOT NULL")
+    if not cur.fetchone()[0]:
+        print("empty"); sys.exit()
+    cur.execute("SELECT state FROM ir_module_module WHERE name = 'base'")
+    row = cur.fetchone()
+    print("ready" if row and row[0] in ("installed", "to upgrade", "to remove") else "empty")
+PY
 }
+
+# First start: create and initialise the database. A Postgres advisory lock
+# makes concurrent starts (two deployments overlapping) take turns, so one
+# never drops a database the other is still initialising.
+init_db() {
+  local state force=()
+  state="$(db_state)"
+  if [ "$state" = ready ]; then
+    log "database ${DB_NAME} was initialised by another start"
+    return
+  fi
+  log "first start: initialising database ${DB_NAME} (this takes a minute or two)"
+  [ "$state" = empty ] && force=(--force)
+  as_odoo odoo db -c "$CONF" init "${force[@]}" --language "$LANGUAGE" \
+    --username "$ADMIN_LOGIN" --password "$ODOO_ADMIN_PASSWORD" "$DB_NAME"
+  log "database ${DB_NAME} initialised; log in as '${ADMIN_LOGIN}' with ODOO_ADMIN_PASSWORD"
+}
+
+if [ "${1:-}" = --init-locked ]; then
+  init_db
+  exit 0
+fi
 
 state="$(db_state)"
 if [ "$state" != ready ]; then
-  log "first start: initialising database ${DB_NAME} (this takes a minute or two)"
   # Answer the health check while the database is being created.
   python3 - "$HTTP_PORT" <<'PY' &
 import sys, http.server
@@ -98,13 +130,15 @@ class H(http.server.BaseHTTPRequestHandler):
 http.server.ThreadingHTTPServer(('0.0.0.0', int(sys.argv[1])), H).serve_forever()
 PY
   placeholder=$!
-  force=()
-  [ "$state" = empty ] && force=(--force)
-  as_odoo odoo db -c "$CONF" init "${force[@]}" --language "$LANGUAGE" \
-    --username "$ADMIN_LOGIN" --password "$ODOO_ADMIN_PASSWORD" "$DB_NAME"
+  python3 - "$0" --init-locked <<'PY'
+import os, sys, subprocess, psycopg2
+conn = psycopg2.connect(os.environ["DATABASE_URL"])
+conn.autocommit = True
+conn.cursor().execute("SELECT pg_advisory_lock(hashtext('odoo-railway-template-init'))")
+sys.exit(subprocess.call(sys.argv[1:]))
+PY
   kill "$placeholder" 2>/dev/null || true
   wait "$placeholder" 2>/dev/null || true
-  log "database ${DB_NAME} initialised; log in as '${ADMIN_LOGIN}' with ODOO_ADMIN_PASSWORD"
 else
   log "database ${DB_NAME} already initialised"
 fi
